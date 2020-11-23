@@ -1,21 +1,15 @@
-import numpy as np
-import pandas as pd
-import xgboost as xgb
 import operator
 import warnings
 
-
-########################################################################################
-#
-# Main Class and Methods
-#
-########################################################################################
+import numpy as np
+import pandas as pd
+import xgboost as xgb
 
 
 class BoostARoota(object):
     def __init__(
         self,
-        metric=None,
+        param=None,
         clf=None,
         cutoff=4,
         iters=10,
@@ -23,7 +17,7 @@ class BoostARoota(object):
         delta=0.1,
         silent=False,
     ):
-        self.metric = metric
+        self.param = param
         self.clf = clf
         self.cutoff = cutoff
         self.iters = iters
@@ -33,8 +27,8 @@ class BoostARoota(object):
         self.keep_vars_ = None
 
         # Throw errors if the inputted parameters don't meet the necessary criteria
-        if (metric is None) and (clf is None):
-            raise ValueError("you must enter one of metric or clf as arguments")
+        if (param is None) and (clf is None):
+            raise ValueError("you must enter one of param or clf as arguments")
         if cutoff <= 0:
             raise ValueError(
                 "cutoff should be greater than 0. You entered" + str(cutoff)
@@ -45,9 +39,9 @@ class BoostARoota(object):
             raise ValueError("delta should be between 0 and 1, was " + str(delta))
 
         # Issue warnings for parameters to still let it run
-        if (metric is not None) and (clf is not None):
+        if (param is not None) and (clf is not None):
             warnings.warn(
-                "You entered values for metric and clf, defaulting to clf and ignoring metric"
+                "You entered values for param and clf, defaulting to clf and ignoring param"
             )
         if delta < 0.02:
             warnings.warn(
@@ -62,7 +56,7 @@ class BoostARoota(object):
         self.keep_vars_ = _BoostARoota(
             x,
             y,
-            metric=self.metric,
+            param=self.param,
             clf=self.clf,
             cutoff=self.cutoff,
             iters=self.iters,
@@ -113,37 +107,14 @@ def _create_shadow(x_train):
 ########################################################################################
 
 
-def _reduce_vars_xgb(x, y, metric, this_round, cutoff, n_iterations, delta, silent):
-    """
-    Function to run through each
-    :param x: Input dataframe - X
-    :param y: Target variable
-    :param metric: Metric to optimize in XGBoost
-    :param this_round: Round so it can be printed to screen
-    :return: tuple - stopping criteria and the variables to keep
-    """
-    # Set up the parameters for running the model in XGBoost - split is on multi log loss
-    if metric == "mlogloss":
-        param = {
-            "objective": "multi:softmax",
-            "eval_metric": "mlogloss",
-            "num_class": len(np.unique(y)),
-            "silent": 1,
-        }
-    else:
-        param = {"eval_metric": metric, "silent": 1}
-    for i in range(1, n_iterations + 1):
+def _reduce_vars_core(
+    x, y, param, this_round, cutoff, n_iterations, delta, silent, inner_func
+):
+    new_x, shadow_names = _create_shadow(x)
+    df = pd.DataFrame({"feature": new_x.columns})
+    for i in range(n_iterations):
         # Create the shadow variables and run the model to obtain importances
-        new_x, shadow_names = _create_shadow(x)
-        dtrain = xgb.DMatrix(new_x, label=y)
-        bst = xgb.train(param, dtrain, verbose_eval=False)
-        if i == 1:
-            df = pd.DataFrame({"feature": new_x.columns})
-            pass
-
-        importance = bst.get_fscore()
-        importance = sorted(importance.items(), key=operator.itemgetter(1))
-        df2 = pd.DataFrame(importance, columns=["feature", "fscore" + str(i)])
+        df2 = inner_func(x, y, param, df)
         df2["fscore" + str(i)] = df2["fscore" + str(i)] / df2["fscore" + str(i)].sum()
         df = pd.merge(df, df2, on="feature", how="outer")
         if not silent:
@@ -156,81 +127,94 @@ def _reduce_vars_xgb(x, y, metric, this_round, cutoff, n_iterations, delta, sile
 
     # Get mean value from the shadows
     mean_shadow = shadow_vars["Mean"].mean() / cutoff
+    mean_shadow = mean_shadow if not np.isnan(mean_shadow) else 0
     real_vars = real_vars[(real_vars.Mean > mean_shadow)]
 
     # Check for the stopping criteria
     # Basically looking to make sure we are removing at least 10% of the variables, or we should stop
-    if (len(real_vars["feature"]) / len(x.columns)) > (1 - delta):
-        criteria = True
-    else:
-        criteria = False
-
+    criteria = (len(real_vars["feature"]) / len(x.columns)) > (1 - delta)
     return criteria, real_vars["feature"]
 
 
-def _reduce_vars_sklearn(x, y, clf, this_round, cutoff, n_iterations, delta, silent):
+def _reduce_vars_xgb_inner(x, y, param, df, i):
+    new_x, shadow_names = _create_shadow(x)
+    dtrain = xgb.DMatrix(new_x, label=y)
+    bst = xgb.train(param, dtrain, verbose_eval=False)
+
+    importance = bst.get_fscore()
+    importance = sorted(importance.items(), key=operator.itemgetter(1))
+    df2 = pd.DataFrame(importance, columns=["feature", "fscore" + str(i)])
+    return df2
+
+
+def _reduce_vars_sklearn_inner(x, y, param, df, i):
+    new_x, shadow_names = _create_shadow(x)
+    df2 = df.copy()
+    param = param.fit(new_x, np.ravel(y))
+
+    try:
+        importance = param.feature_importances_
+        df2["fscore" + str(i)] = importance
+    except ValueError:
+        print(
+            "this clf doesn't have the feature_importances_ method.  Only Sklearn tree based methods allowed"
+        )
+    return df2
+
+
+def _reduce_vars_xgb(x, y, param, this_round, cutoff, n_iterations, delta, silent):
     """
     Function to run through each
     :param x: Input dataframe - X
     :param y: Target variable
-    :param clf: the fully specified classifier passed in by user
+    :param param: training parameters for xgboost
     :param this_round: Round so it can be printed to screen
     :return: tuple - stopping criteria and the variables to keep
     """
     # Set up the parameters for running the model in XGBoost - split is on multi log loss
+    return _reduce_vars_core(
+        x,
+        y,
+        param,
+        this_round,
+        cutoff,
+        n_iterations,
+        delta,
+        silent,
+        _reduce_vars_xgb_inner,
+    )
 
-    for i in range(1, n_iterations + 1):
-        # Create the shadow variables and run the model to obtain importances
-        new_x, shadow_names = _create_shadow(x)
-        clf = clf.fit(new_x, np.ravel(y))
 
-        if i == 1:
-            df = pd.DataFrame({"feature": new_x.columns})
-            df2 = df.copy()
-            pass
-
-        try:
-            importance = clf.feature_importances_
-            df2["fscore" + str(i)] = importance
-        except ValueError:
-            print(
-                "this clf doesn't have the feature_importances_ method.  Only Sklearn tree based methods allowed"
-            )
-
-        # importance = sorted(importance.items(), key=operator.itemgetter(1))
-
-        # df2 = pd.DataFrame(importance, columns=['feature', 'fscore'+str(i)])
-        df2["fscore" + str(i)] = df2["fscore" + str(i)] / df2["fscore" + str(i)].sum()
-        df = pd.merge(df, df2, on="feature", how="outer")
-        if not silent:
-            print("Round: ", this_round, " iteration: ", i)
-
-    df["Mean"] = df.mean(axis=1)
-    # Split them back out
-    real_vars = df[~df["feature"].isin(shadow_names)]
-    shadow_vars = df[df["feature"].isin(shadow_names)]
-
-    # Get mean value from the shadows
-    mean_shadow = shadow_vars["Mean"].mean() / cutoff
-    real_vars = real_vars[(real_vars.Mean > mean_shadow)]
-
-    # Check for the stopping criteria
-    # Basically looking to make sure we are removing at least 10% of the variables, or we should stop
-    if (len(real_vars["feature"]) / len(x.columns)) > (1 - delta):
-        criteria = True
-    else:
-        criteria = False
-
-    return criteria, real_vars["feature"]
+def _reduce_vars_sklearn(x, y, param, this_round, cutoff, n_iterations, delta, silent):
+    """
+    Function to run through each
+    :param x: Input dataframe - X
+    :param y: Target variable
+    :param param: training parameters for xgboost
+    :param this_round: Round so it can be printed to screen
+    :return: tuple - stopping criteria and the variables to keep
+    """
+    # Set up the parameters for running the model in XGBoost - split is on multi log loss
+    return _reduce_vars_core(
+        x,
+        y,
+        param,
+        this_round,
+        cutoff,
+        n_iterations,
+        delta,
+        silent,
+        _reduce_vars_sklearn_inner,
+    )
 
 
 # Main function exposed to run the algorithm
-def _BoostARoota(x, y, metric, clf, cutoff, iters, max_rounds, delta, silent):
+def _BoostARoota(x, y, param, clf, cutoff, iters, max_rounds, delta, silent):
     """
     Function loops through, waiting for the stopping criteria to change
     :param x: X dataframe One Hot Encoded
     :param y: Labels for the target variable
-    :param metric: The metric to optimize in XGBoost
+    :param param: param dict to pass to xgboost
     :return: names of the variables to keep
     """
 
@@ -244,7 +228,7 @@ def _BoostARoota(x, y, metric, clf, cutoff, iters, max_rounds, delta, silent):
             crit, keep_vars = _reduce_vars_xgb(
                 new_x,
                 y,
-                metric=metric,
+                param=param,
                 this_round=i,
                 cutoff=cutoff,
                 n_iterations=iters,
